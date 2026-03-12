@@ -1,14 +1,16 @@
 #!/bin/bash
 
 # ==============================================================================
-# FIVEM GATEWAY MANAGER
-# - Mode Owner Server (load-balance mapping)
-# - Mode Player Limited (soft connection cap)
-# - Discord Webhook Monitor (5-minute heartbeat via systemd timer)
+# FIVEM PLAYER GATE MANAGER (PLAYER ONLY)
+# - Random gate port auto-select in range 30000-39999
+# - Port must be unused and not adjacent (+/-1) to existing ports
+# - Discord webhook monitor every 5 minutes (systemd timer)
 # ==============================================================================
 
-OWNER_TARGETS_FILE="/etc/nginx/gate_owner_targets.list"
-LEGACY_TARGETS_FILE="/etc/nginx/gate_targets.list"
+GATE_RANGE_MIN=30000
+GATE_RANGE_MAX=39999
+MIN_PORT_GAP=25
+
 PLAYER_TARGETS_FILE="/etc/nginx/gate_player_targets.list"
 WEBHOOK_CONFIG_FILE="/etc/nginx/gate_webhook.conf"
 STREAM_CONF_FILE="/etc/nginx/stream.conf"
@@ -16,6 +18,7 @@ NGINX_CONF_FILE="/etc/nginx/nginx.conf"
 MONITOR_SCRIPT="/usr/local/bin/fivem_gate_monitor.sh"
 MONITOR_SERVICE="/etc/systemd/system/fivem-gate-monitor.service"
 MONITOR_TIMER="/etc/systemd/system/fivem-gate-monitor.timer"
+MONITOR_STATE_DIR="/var/lib/fivem-gate"
 
 print_info() { echo -e "\e[34m[INFO]\e[0m $1"; }
 print_success() { echo -e "\e[32m[SUKSES]\e[0m $1"; }
@@ -30,13 +33,17 @@ require_root() {
 ensure_base_files() {
     [ -d "/etc/nginx" ] || mkdir -p /etc/nginx
     [ -d "/etc/nginx/ssl" ] || mkdir -p /etc/nginx/ssl
-    [ -f "$OWNER_TARGETS_FILE" ] || touch "$OWNER_TARGETS_FILE"
+    [ -d "$MONITOR_STATE_DIR" ] || mkdir -p "$MONITOR_STATE_DIR"
     [ -f "$PLAYER_TARGETS_FILE" ] || touch "$PLAYER_TARGETS_FILE"
     [ -f "$WEBHOOK_CONFIG_FILE" ] || echo "WEBHOOK_URL=" > "$WEBHOOK_CONFIG_FILE"
 }
 
 is_valid_port() {
     [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+is_valid_range_port() {
+    [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge "$GATE_RANGE_MIN" ] && [ "$1" -le "$GATE_RANGE_MAX" ]
 }
 
 is_valid_ipv4() {
@@ -46,21 +53,6 @@ is_valid_ipv4() {
     for oct in "$a" "$b" "$c" "$d"; do
         [ "$oct" -ge 0 ] && [ "$oct" -le 255 ] || return 1
     done
-}
-
-port_exists_in_owner() {
-    local p="$1"
-    grep -E "^${p}:" "$OWNER_TARGETS_FILE" >/dev/null 2>&1
-}
-
-port_exists_in_player() {
-    local p="$1"
-    grep -E "^${p}:" "$PLAYER_TARGETS_FILE" >/dev/null 2>&1
-}
-
-port_in_use_any_mode() {
-    local p="$1"
-    port_exists_in_owner "$p" || port_exists_in_player "$p"
 }
 
 install_nginx() {
@@ -96,11 +88,63 @@ cleanup_old_defaults() {
     [ -d "/etc/nginx/ssl" ] || mkdir -p /etc/nginx/ssl
 }
 
-migrate_legacy_owner_targets() {
-    if [ -s "$LEGACY_TARGETS_FILE" ] && [ ! -s "$OWNER_TARGETS_FILE" ]; then
-        cp "$LEGACY_TARGETS_FILE" "$OWNER_TARGETS_FILE"
-        print_success "Data legacy dimigrasikan ke mode Owner Server."
+get_used_gate_ports() {
+    awk -F':' 'NF{print $1}' "$PLAYER_TARGETS_FILE" 2>/dev/null | grep -E '^[0-9]+$' | sort -n | uniq
+}
+
+port_exists_in_player() {
+    local p="$1"
+    grep -E "^${p}:" "$PLAYER_TARGETS_FILE" >/dev/null 2>&1
+}
+
+is_too_close_to_existing() {
+    local p="$1"
+    local ep
+    while IFS= read -r ep; do
+        [ -n "$ep" ] || continue
+        local diff=$((p - ep))
+        [ "$diff" -lt 0 ] && diff=$((diff * -1))
+        if [ "$diff" -lt "$MIN_PORT_GAP" ]; then
+            return 0
+        fi
+    done < <(get_used_gate_ports)
+    return 1
+}
+
+count_available_random_slots() {
+    local c=0
+    local p
+    for p in $(seq "$GATE_RANGE_MIN" "$GATE_RANGE_MAX"); do
+        if ! is_too_close_to_existing "$p"; then
+            c=$((c + 1))
+        fi
+    done
+    echo "$c"
+}
+
+pick_random_gate_port() {
+    local p
+
+    if command -v shuf >/dev/null 2>&1; then
+        while IFS= read -r p; do
+            if ! is_too_close_to_existing "$p"; then
+                echo "$p"
+                return 0
+            fi
+        done < <(seq "$GATE_RANGE_MIN" "$GATE_RANGE_MAX" | shuf)
     fi
+
+    local tries=0
+    while [ "$tries" -lt 20000 ]; do
+        p=$((RANDOM % (GATE_RANGE_MAX - GATE_RANGE_MIN + 1) + GATE_RANGE_MIN))
+        if ! is_too_close_to_existing "$p"; then
+            echo "$p"
+            return 0
+        fi
+        tries=$((tries + 1))
+    done
+
+    return 1
 }
 
 open_gate_ports_in_firewall() {
@@ -109,12 +153,7 @@ open_gate_ports_in_firewall() {
         [ -n "$p" ] || continue
         ufw allow "$p/tcp" >/dev/null 2>&1
         ufw allow "$p/udp" >/dev/null 2>&1
-    done < <(
-        {
-            cut -d':' -f1 "$OWNER_TARGETS_FILE" 2>/dev/null
-            awk -F':' '{print $1}' "$PLAYER_TARGETS_FILE" 2>/dev/null
-        } | sort -n | uniq
-    )
+    done < "$PLAYER_TARGETS_FILE"
 }
 
 write_main_nginx_conf() {
@@ -151,80 +190,36 @@ EOF
 generate_stream_conf() {
     echo "stream {" > "$STREAM_CONF_FILE"
 
-    # ----------------------
-    # Mode Owner Server
-    # ----------------------
-    local owner_ports=()
-    local line gp tip tport
-
-    while IFS= read -r line; do
-        [ -n "$line" ] || continue
-        gp=$(echo "$line" | cut -d':' -f1)
-        is_valid_port "$gp" || continue
-        if [[ ! " ${owner_ports[*]} " =~ " ${gp} " ]]; then
-            owner_ports+=("$gp")
-        fi
-    done < "$OWNER_TARGETS_FILE"
-
-    local port entry
-    for port in "${owner_ports[@]}"; do
-        echo "    upstream owner_backend_${port} {" >> "$STREAM_CONF_FILE"
-        while IFS= read -r entry; do
-            [ -n "$entry" ] || continue
-            gp=$(echo "$entry" | cut -d':' -f1)
-            tip=$(echo "$entry" | cut -d':' -f2)
-            tport=$(echo "$entry" | cut -d':' -f3)
-            [ "$gp" = "$port" ] || continue
-            is_valid_ipv4 "$tip" || continue
-            is_valid_port "$tport" || continue
-            echo "        server ${tip}:${tport};" >> "$STREAM_CONF_FILE"
-        done < "$OWNER_TARGETS_FILE"
-        echo "    }" >> "$STREAM_CONF_FILE"
-
-        echo "    server {" >> "$STREAM_CONF_FILE"
-        echo "        listen ${port};" >> "$STREAM_CONF_FILE"
-        echo "        proxy_pass owner_backend_${port};" >> "$STREAM_CONF_FILE"
-        echo "    }" >> "$STREAM_CONF_FILE"
-
-        echo "    server {" >> "$STREAM_CONF_FILE"
-        echo "        listen ${port} udp reuseport;" >> "$STREAM_CONF_FILE"
-        echo "        proxy_pass owner_backend_${port};" >> "$STREAM_CONF_FILE"
-        echo "    }" >> "$STREAM_CONF_FILE"
-    done
-
-    # ----------------------
-    # Mode Player Limited
     # format: gate_port:target_ip:target_port:conn_limit:overflow:status:label
-    # ----------------------
-    local pgate pip pbackend plimit poverflow pstatus plabel effective
-    while IFS=':' read -r pgate pip pbackend plimit poverflow pstatus plabel; do
-        [ -n "$pgate" ] || continue
-        [ "$pstatus" = "active" ] || continue
+    local gp tip tport limit extra status label effective
+    while IFS=':' read -r gp tip tport limit extra status label; do
+        [ -n "$gp" ] || continue
+        [ "$status" = "active" ] || continue
 
-        is_valid_port "$pgate" || continue
-        is_valid_ipv4 "$pip" || continue
-        is_valid_port "$pbackend" || continue
-        [[ "$plimit" =~ ^[0-9]+$ ]] || continue
-        [[ "$poverflow" =~ ^[0-9]+$ ]] || continue
+        is_valid_range_port "$gp" || continue
+        is_valid_ipv4 "$tip" || continue
+        is_valid_port "$tport" || continue
+        [[ "$limit" =~ ^[0-9]+$ ]] || continue
+        [[ "$extra" =~ ^[0-9]+$ ]] || continue
 
-        effective=$((plimit + poverflow))
+        effective=$((limit + extra))
         [ "$effective" -ge 1 ] || effective=1
 
-        echo "    limit_conn_zone \$server_port zone=gate_conn_${pgate}:1m;" >> "$STREAM_CONF_FILE"
-        echo "    upstream player_backend_${pgate} {" >> "$STREAM_CONF_FILE"
-        echo "        server ${pip}:${pbackend};" >> "$STREAM_CONF_FILE"
+        echo "    limit_conn_zone \$server_port zone=gate_conn_${gp}:1m;" >> "$STREAM_CONF_FILE"
+        echo "    upstream player_backend_${gp} {" >> "$STREAM_CONF_FILE"
+        echo "        server ${tip}:${tport};" >> "$STREAM_CONF_FILE"
         echo "    }" >> "$STREAM_CONF_FILE"
 
         echo "    server {" >> "$STREAM_CONF_FILE"
-        echo "        listen ${pgate};" >> "$STREAM_CONF_FILE"
-        echo "        proxy_pass player_backend_${pgate};" >> "$STREAM_CONF_FILE"
-        echo "        limit_conn gate_conn_${pgate} ${effective};" >> "$STREAM_CONF_FILE"
+        echo "        listen ${gp};" >> "$STREAM_CONF_FILE"
+        echo "        proxy_pass player_backend_${gp};" >> "$STREAM_CONF_FILE"
+        echo "        limit_conn gate_conn_${gp} ${effective};" >> "$STREAM_CONF_FILE"
         echo "    }" >> "$STREAM_CONF_FILE"
 
         echo "    server {" >> "$STREAM_CONF_FILE"
-        echo "        listen ${pgate} udp reuseport;" >> "$STREAM_CONF_FILE"
-        echo "        proxy_pass player_backend_${pgate};" >> "$STREAM_CONF_FILE"
-        echo "        limit_conn gate_conn_${pgate} ${effective};" >> "$STREAM_CONF_FILE"
+        echo "        listen ${gp} udp reuseport;" >> "$STREAM_CONF_FILE"
+        echo "        proxy_pass player_backend_${gp};" >> "$STREAM_CONF_FILE"
+        echo "        limit_conn gate_conn_${gp} ${effective};" >> "$STREAM_CONF_FILE"
         echo "    }" >> "$STREAM_CONF_FILE"
     done < "$PLAYER_TARGETS_FILE"
 
@@ -250,88 +245,13 @@ apply_nginx_config() {
         return 0
     fi
 
-    print_error "Gagal me-restart Nginx."
+    print_error "Gagal restart Nginx."
     return 1
-}
-
-list_owner_targets() {
-    echo ""
-    echo "--- Mode Owner Server ---"
-    if [ ! -s "$OWNER_TARGETS_FILE" ]; then
-        echo "(Kosong)"
-        return
-    fi
-
-    printf "%-4s | %-10s | %-16s | %-10s\n" "No" "Gate" "Target IP" "Port"
-    echo "------------------------------------------------"
-
-    local i=0
-    while IFS=':' read -r gp tip tport; do
-        [ -n "$gp" ] || continue
-        i=$((i + 1))
-        printf "%-4s | %-10s | %-16s | %-10s\n" "$i" "$gp" "$tip" "$tport"
-    done < "$OWNER_TARGETS_FILE"
-}
-
-add_owner_target() {
-    echo ""
-    print_info "Tambah mapping Owner Server"
-    read -r -p "Gate Port (contoh 30120): " gp
-    read -r -p "Target Backend IP: " tip
-    read -r -p "Target Backend Port (default 30120): " tport
-    tport=${tport:-30120}
-
-    if ! is_valid_port "$gp"; then
-        print_error "Gate port tidak valid."
-        return
-    fi
-    if ! is_valid_ipv4 "$tip"; then
-        print_error "IP backend tidak valid (IPv4)."
-        return
-    fi
-    if ! is_valid_port "$tport"; then
-        print_error "Port backend tidak valid."
-        return
-    fi
-
-    if port_exists_in_player "$gp"; then
-        print_error "Port ${gp} sudah dipakai mode Player. Gunakan port lain."
-        return
-    fi
-
-    echo "${gp}:${tip}:${tport}" >> "$OWNER_TARGETS_FILE"
-    if apply_nginx_config; then
-        print_success "Mapping owner ditambahkan: ${gp} -> ${tip}:${tport}"
-    else
-        print_error "Mapping tersimpan, tapi apply config gagal."
-    fi
-}
-
-delete_owner_target() {
-    list_owner_targets
-    [ -s "$OWNER_TARGETS_FILE" ] || return
-
-    read -r -p "Nomor yang ingin dihapus (0=batal): " choice
-    [[ "$choice" =~ ^[0-9]+$ ]] || return
-    [ "$choice" -ge 1 ] || return
-
-    local selected
-    selected=$(awk -F':' -v n="$choice" 'NF{c++; if(c==n){print $0; exit}}' "$OWNER_TARGETS_FILE")
-    [ -n "$selected" ] || return
-
-    awk -F':' -v n="$choice" 'NF{c++; if(c!=n) print $0}' "$OWNER_TARGETS_FILE" > "${OWNER_TARGETS_FILE}.tmp"
-    mv "${OWNER_TARGETS_FILE}.tmp" "$OWNER_TARGETS_FILE"
-
-    if apply_nginx_config; then
-        print_success "Mapping owner dihapus: $selected"
-    else
-        print_error "Hapus tersimpan, tapi apply config gagal."
-    fi
 }
 
 list_player_gates() {
     echo ""
-    echo "--- Mode Player Limited ---"
+    echo "--- PLAYER GATES (${GATE_RANGE_MIN}-${GATE_RANGE_MAX}) ---"
     if [ ! -s "$PLAYER_TARGETS_FILE" ]; then
         echo "(Kosong)"
         return
@@ -348,25 +268,19 @@ list_player_gates() {
     done < "$PLAYER_TARGETS_FILE"
 }
 
-add_player_gate() {
+add_player_gate_auto() {
     echo ""
-    print_info "Tambah gate Player (limited)"
-    read -r -p "Gate Port customer: " gp
+    print_info "Tambah gate player (PORT RANDOM AUTO)"
     read -r -p "Target Backend IP: " tip
     read -r -p "Target Backend Port (default 30120): " tport
     read -r -p "Limit dasar (default 2): " limit
     read -r -p "Overflow toleransi (default 3): " extra
-    read -r -p "Label customer (default gate_<port>): " label
+    read -r -p "Label customer (default auto): " label
 
     tport=${tport:-30120}
     limit=${limit:-2}
     extra=${extra:-3}
-    label=${label:-gate_$gp}
 
-    if ! is_valid_port "$gp"; then
-        print_error "Gate port tidak valid."
-        return
-    fi
     if ! is_valid_ipv4 "$tip"; then
         print_error "IP backend tidak valid (IPv4)."
         return
@@ -378,18 +292,24 @@ add_player_gate() {
     [[ "$limit" =~ ^[0-9]+$ ]] || { print_error "Limit harus angka."; return; }
     [[ "$extra" =~ ^[0-9]+$ ]] || { print_error "Overflow harus angka."; return; }
 
-    if port_exists_in_owner "$gp"; then
-        print_error "Port ${gp} sudah dipakai mode Owner. Gunakan port lain."
-        return
-    fi
-    if port_exists_in_player "$gp"; then
-        print_error "Port ${gp} sudah ada di mode Player."
+    local free_count gp
+    free_count=$(count_available_random_slots)
+    if [ "$free_count" -le 0 ]; then
+        print_error "Tidak ada port tersedia di range ${GATE_RANGE_MIN}-${GATE_RANGE_MAX} dengan jarak minimum ${MIN_PORT_GAP}."
         return
     fi
 
+    gp=$(pick_random_gate_port)
+    if [ -z "$gp" ]; then
+        print_error "Gagal memilih port random."
+        return
+    fi
+
+    label=${label:-gate_$gp}
     echo "${gp}:${tip}:${tport}:${limit}:${extra}:active:${label}" >> "$PLAYER_TARGETS_FILE"
+
     if apply_nginx_config; then
-        print_success "Gate player ditambahkan: ${gp} -> ${tip}:${tport} (limit ${limit}+${extra})"
+        print_success "Gate dibuat: ${gp} -> ${tip}:${tport} (limit ${limit}+${extra})"
     else
         print_error "Gate tersimpan, tapi apply config gagal."
     fi
@@ -403,12 +323,13 @@ edit_player_gate_limit() {
     [[ "$choice" =~ ^[0-9]+$ ]] || return
     [ "$choice" -ge 1 ] || return
 
-    local row
+    local row gp limit extra nlimit nextra
     row=$(awk -F':' -v n="$choice" 'NF{c++; if(c==n){print $0; exit}}' "$PLAYER_TARGETS_FILE")
     [ -n "$row" ] || return
 
-    local gp tip tport limit extra status label
-    IFS=':' read -r gp tip tport limit extra status label <<< "$row"
+    gp=$(echo "$row" | cut -d':' -f1)
+    limit=$(echo "$row" | cut -d':' -f4)
+    extra=$(echo "$row" | cut -d':' -f5)
 
     read -r -p "Limit dasar baru (sekarang $limit): " nlimit
     read -r -p "Overflow baru (sekarang $extra): " nextra
@@ -484,7 +405,7 @@ delete_player_gate() {
     mv "${PLAYER_TARGETS_FILE}.tmp" "$PLAYER_TARGETS_FILE"
 
     if apply_nginx_config; then
-        print_success "Gate player dihapus: $selected"
+        print_success "Gate dihapus: $selected"
     else
         print_error "Hapus tersimpan, tapi apply config gagal."
     fi
@@ -494,9 +415,150 @@ create_monitor_script() {
     cat <<'EOF' > "$MONITOR_SCRIPT"
 #!/bin/bash
 
-OWNER_TARGETS_FILE="/etc/nginx/gate_owner_targets.list"
 PLAYER_TARGETS_FILE="/etc/nginx/gate_player_targets.list"
 WEBHOOK_CONFIG_FILE="/etc/nginx/gate_webhook.conf"
+STATE_DIR="/var/lib/fivem-gate"
+STATE_FILE="${STATE_DIR}/monitor.state"
+
+mkdir -p "$STATE_DIR"
+
+json_escape() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+get_cpu_usage_percent() {
+    local c1 c2 idle1 idle2 total1 total2 idle_delta total_delta
+    c1=$(awk '/^cpu / {print $2,$3,$4,$5,$6,$7,$8,$9}' /proc/stat)
+    sleep 1
+    c2=$(awk '/^cpu / {print $2,$3,$4,$5,$6,$7,$8,$9}' /proc/stat)
+
+    read -r u1 n1 s1 i1 w1 irq1 sirq1 st1 <<< "$c1"
+    read -r u2 n2 s2 i2 w2 irq2 sirq2 st2 <<< "$c2"
+
+    total1=$((u1+n1+s1+i1+w1+irq1+sirq1+st1))
+    total2=$((u2+n2+s2+i2+w2+irq2+sirq2+st2))
+    idle1=$((i1+w1))
+    idle2=$((i2+w2))
+
+    total_delta=$((total2-total1))
+    idle_delta=$((idle2-idle1))
+    if [ "$total_delta" -le 0 ]; then
+        echo "0.00"
+        return
+    fi
+
+    awk -v t="$total_delta" -v i="$idle_delta" 'BEGIN { printf "%.2f", ((t-i)*100)/t }'
+}
+
+get_ram_usage() {
+    local total used pct
+    total=$(awk '/MemTotal:/ {print $2}' /proc/meminfo)
+    available=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)
+    used=$((total - available))
+    if [ "$total" -le 0 ]; then
+        echo "0.00|0|0"
+        return
+    fi
+    pct=$(awk -v u="$used" -v t="$total" 'BEGIN { printf "%.2f", (u*100)/t }')
+    echo "${pct}|$((used/1024))|$((total/1024))"
+}
+
+detect_iface() {
+    ip route get 1.1.1.1 2>/dev/null | awk '{
+        for(i=1;i<=NF;i++){
+            if($i=="dev"){print $(i+1); exit}
+        }
+    }'
+}
+
+estimate_connected_players() {
+    local ports_csv="$1"
+    if [ -z "$ports_csv" ]; then
+        echo "0"
+        return
+    fi
+
+    ss -H -ntu 2>/dev/null | awk -v ports="$ports_csv" '
+        BEGIN {
+            split(ports, p, ",");
+            for (i in p) allow[p[i]] = 1;
+        }
+        {
+            local = $5;
+            peer = $6;
+            lp = local;
+            sub(/^.*:/, "", lp);
+            if (allow[lp]) {
+                host = peer;
+                sub(/:[^:]*$/, "", host);
+                gsub(/^\[/, "", host);
+                gsub(/\]$/, "", host);
+                if (host != "" && host != "*" && host != "127.0.0.1") seen[host] = 1;
+            }
+        }
+        END {
+            c = 0;
+            for (h in seen) c++;
+            print c + 0;
+        }'
+}
+
+calc_5m_bandwidth() {
+    local iface="$1"
+    local now rx_now tx_now prev_ts prev_rx prev_tx prev_iface dt drx dtx
+    now=$(date +%s)
+
+    if [ -z "$iface" ] || [ ! -d "/sys/class/net/$iface" ]; then
+        echo "N/A|N/A|N/A|N/A|N/A"
+        return
+    fi
+
+    rx_now=$(cat "/sys/class/net/$iface/statistics/rx_bytes" 2>/dev/null)
+    tx_now=$(cat "/sys/class/net/$iface/statistics/tx_bytes" 2>/dev/null)
+    [ -n "$rx_now" ] || rx_now=0
+    [ -n "$tx_now" ] || tx_now=0
+
+    prev_ts=0
+    prev_rx=0
+    prev_tx=0
+    prev_iface=""
+    if [ -f "$STATE_FILE" ]; then
+        IFS='|' read -r prev_ts prev_rx prev_tx prev_iface < "$STATE_FILE"
+    fi
+
+    echo "${now}|${rx_now}|${tx_now}|${iface}" > "$STATE_FILE"
+
+    if [ "$prev_ts" -le 0 ] || [ "$prev_iface" != "$iface" ]; then
+        echo "0 B|0 B|N/A|N/A|N/A"
+        return
+    fi
+
+    dt=$((now - prev_ts))
+    [ "$dt" -gt 0 ] || dt=300
+    drx=$((rx_now - prev_rx))
+    dtx=$((tx_now - prev_tx))
+    [ "$drx" -ge 0 ] || drx=0
+    [ "$dtx" -ge 0 ] || dtx=0
+
+    rx_h=$(awk -v b="$drx" 'BEGIN{
+        if (b < 1024) printf "%d B", b;
+        else if (b < 1048576) printf "%.2f KB", b/1024;
+        else if (b < 1073741824) printf "%.2f MB", b/1048576;
+        else printf "%.2f GB", b/1073741824;
+    }')
+    tx_h=$(awk -v b="$dtx" 'BEGIN{
+        if (b < 1024) printf "%d B", b;
+        else if (b < 1048576) printf "%.2f KB", b/1024;
+        else if (b < 1073741824) printf "%.2f MB", b/1048576;
+        else printf "%.2f GB", b/1073741824;
+    }')
+
+    rx_mbps=$(awk -v b="$drx" -v s="$dt" 'BEGIN { if(s<=0){print "0.00"} else printf "%.2f", (b*8)/(s*1000000) }')
+    tx_mbps=$(awk -v b="$dtx" -v s="$dt" 'BEGIN { if(s<=0){print "0.00"} else printf "%.2f", (b*8)/(s*1000000) }')
+    window="${dt}s"
+
+    echo "${rx_h}|${tx_h}|${rx_mbps}|${tx_mbps}|${window}"
+}
 
 [ -f "$WEBHOOK_CONFIG_FILE" ] || exit 0
 # shellcheck disable=SC1090
@@ -512,9 +574,6 @@ if nginx -t >/dev/null 2>&1; then
     nginx_test="OK"
 fi
 
-total_owner=0
-[ -f "$OWNER_TARGETS_FILE" ] && total_owner=$(grep -c '^[0-9]' "$OWNER_TARGETS_FILE" 2>/dev/null)
-
 total_player=0
 active_player=0
 if [ -f "$PLAYER_TARGETS_FILE" ]; then
@@ -523,29 +582,78 @@ if [ -f "$PLAYER_TARGETS_FILE" ]; then
 fi
 
 listening_total=0
-all_ports=$( {
-    [ -f "$OWNER_TARGETS_FILE" ] && cut -d':' -f1 "$OWNER_TARGETS_FILE"
-    [ -f "$PLAYER_TARGETS_FILE" ] && awk -F':' '$6=="active"{print $1}' "$PLAYER_TARGETS_FILE"
-} | sort -n | uniq )
-
+all_ports=$(awk -F':' '$6=="active"{print $1}' "$PLAYER_TARGETS_FILE" 2>/dev/null | sort -n | uniq)
+ports_csv=$(echo "$all_ports" | tr '\n' ',' | sed 's/,$//')
 for p in $all_ports; do
     if ss -lntu | awk '{print $5}' | grep -E ":${p}$" >/dev/null 2>&1; then
         listening_total=$((listening_total + 1))
     fi
 done
 
+estimated_players=$(estimate_connected_players "$ports_csv")
+cpu_pct=$(get_cpu_usage_percent)
+ram_data=$(get_ram_usage)
+ram_pct=$(echo "$ram_data" | cut -d'|' -f1)
+ram_used_mb=$(echo "$ram_data" | cut -d'|' -f2)
+ram_total_mb=$(echo "$ram_data" | cut -d'|' -f3)
+
+iface=$(detect_iface)
+bw_data=$(calc_5m_bandwidth "$iface")
+rx_5m=$(echo "$bw_data" | cut -d'|' -f1)
+tx_5m=$(echo "$bw_data" | cut -d'|' -f2)
+rx_rate=$(echo "$bw_data" | cut -d'|' -f3)
+tx_rate=$(echo "$bw_data" | cut -d'|' -f4)
+sample_window=$(echo "$bw_data" | cut -d'|' -f5)
+
 status_line="OK"
 if [ "$nginx_state" != "UP" ] || [ "$nginx_test" != "OK" ]; then
     status_line="ALERT"
 fi
 
-now=$(date '+%Y-%m-%d %H:%M:%S')
-msg="[$status_line] FiveM Gate Monitor\nTime: $now\nNginx: $nginx_state (config: $nginx_test)\nOwner gates: $total_owner\nPlayer gates: $active_player/$total_player active\nListening gates: $listening_total"
+if [ "$status_line" = "OK" ]; then
+    color=5763719
+else
+    color=15548997
+fi
 
-escaped=$(printf '%s' "$msg" | sed 's/\\/\\\\/g; s/"/\\"/g')
-escaped=$(printf '%s' "$escaped" | sed ':a;N;$!ba;s/\n/\\n/g')
+now_local=$(date '+%Y-%m-%d %H:%M:%S')
+now_iso=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 
-curl -sS -m 10 -H "Content-Type: application/json" -d "{\"content\":\"$escaped\"}" "$WEBHOOK_URL" >/dev/null 2>&1
+f_status=$(json_escape "Nginx: ${nginx_state} | Config: ${nginx_test}")
+f_gates=$(json_escape "Active: ${active_player}/${total_player} | Listening: ${listening_total}")
+f_players=$(json_escape "Estimated unique source IP: ${estimated_players}")
+f_cpu=$(json_escape "${cpu_pct}%")
+f_ram=$(json_escape "${ram_pct}% (${ram_used_mb}MB/${ram_total_mb}MB)")
+f_bw=$(json_escape "IN ${rx_5m} (${rx_rate} Mbps avg) | OUT ${tx_5m} (${tx_rate} Mbps avg)")
+f_iface=$(json_escape "${iface:-N/A} | Window: ${sample_window}")
+f_time=$(json_escape "${now_local}")
+
+payload=$(cat <<JSON
+{
+  "username": "FiveM Gate Monitor",
+  "embeds": [
+    {
+      "title": "FiveM Player Gate Report",
+      "color": ${color},
+      "fields": [
+        {"name": "Status", "value": "${f_status}", "inline": true},
+        {"name": "Gate", "value": "${f_gates}", "inline": true},
+        {"name": "Player (Estimate)", "value": "${f_players}", "inline": false},
+        {"name": "CPU", "value": "${f_cpu}", "inline": true},
+        {"name": "RAM", "value": "${f_ram}", "inline": true},
+        {"name": "Bandwidth 5m", "value": "${f_bw}", "inline": false},
+        {"name": "Network", "value": "${f_iface}", "inline": true},
+        {"name": "Time", "value": "${f_time}", "inline": true}
+      ],
+      "footer": {"text": "Auto report every 5 minutes"},
+      "timestamp": "${now_iso}"
+    }
+  ]
+}
+JSON
+)
+
+curl -sS -m 15 -H "Content-Type: application/json" -d "$payload" "$WEBHOOK_URL" >/dev/null 2>&1
 EOF
 
     chmod +x "$MONITOR_SCRIPT"
@@ -601,11 +709,29 @@ test_discord_webhook() {
     source "$WEBHOOK_CONFIG_FILE"
     [ -n "$WEBHOOK_URL" ] || { print_error "Webhook kosong."; return; }
 
-    local msg esc
-    msg="[TEST] FiveM Gate webhook aktif ($(date '+%Y-%m-%d %H:%M:%S'))"
-    esc=$(printf '%s' "$msg" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    local now_local now_iso payload
+    now_local=$(date '+%Y-%m-%d %H:%M:%S')
+    now_iso=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    payload=$(cat <<JSON
+{
+  "username": "FiveM Gate Monitor",
+  "embeds": [
+    {
+      "title": "Webhook Test",
+      "description": "Webhook aktif dan siap menerima report monitor.",
+      "color": 3447003,
+      "fields": [
+        {"name": "Status", "value": "OK", "inline": true},
+        {"name": "Time", "value": "${now_local}", "inline": true}
+      ],
+      "timestamp": "${now_iso}"
+    }
+  ]
+}
+JSON
+)
 
-    if curl -sS -m 10 -H "Content-Type: application/json" -d "{\"content\":\"$esc\"}" "$WEBHOOK_URL" >/dev/null 2>&1; then
+    if curl -sS -m 10 -H "Content-Type: application/json" -d "$payload" "$WEBHOOK_URL" >/dev/null 2>&1; then
         print_success "Pesan test terkirim ke Discord."
     else
         print_error "Gagal kirim test webhook."
@@ -622,6 +748,15 @@ enable_discord_monitor() {
 disable_discord_monitor() {
     systemctl disable --now fivem-gate-monitor.timer >/dev/null 2>&1
     print_success "Monitor Discord dimatikan."
+}
+
+send_monitor_report_now() {
+    create_monitor_script
+    if "$MONITOR_SCRIPT"; then
+        print_success "Report monitor berhasil dikirim."
+    else
+        print_error "Gagal mengirim report monitor."
+    fi
 }
 
 show_discord_monitor_status() {
@@ -647,77 +782,29 @@ show_discord_monitor_status() {
     echo ""
 }
 
-count_owner_unique_ports() {
-    cut -d':' -f1 "$OWNER_TARGETS_FILE" 2>/dev/null | grep -E '^[0-9]+$' | sort -n | uniq | wc -l
-}
-
 count_player_active_ports() {
     awk -F':' '$6=="active"{print $1}' "$PLAYER_TARGETS_FILE" 2>/dev/null | grep -E '^[0-9]+$' | sort -n | uniq | wc -l
 }
 
 show_dashboard() {
-    local nginx_state owner_count player_active player_total timer_state
+    local nginx_state active total timer_state slots
     nginx_state=$(systemctl is-active nginx 2>/dev/null || true)
-    owner_count=$(count_owner_unique_ports)
-    player_active=$(count_player_active_ports)
-    player_total=$(grep -c '^[0-9]' "$PLAYER_TARGETS_FILE" 2>/dev/null)
+    active=$(count_player_active_ports)
+    total=$(grep -c '^[0-9]' "$PLAYER_TARGETS_FILE" 2>/dev/null)
     timer_state=$(systemctl is-active fivem-gate-monitor.timer 2>/dev/null || true)
+    slots=$(count_available_random_slots)
 
     echo ""
     echo "=============================================="
-    echo "          FIVEM GATEWAY DASHBOARD"
+    echo "        FIVEM PLAYER GATE DASHBOARD"
     echo "=============================================="
-    echo "Nginx Status      : ${nginx_state:-unknown}"
-    echo "Owner Gate Ports  : ${owner_count}"
-    echo "Player Gates      : ${player_active}/${player_total} active"
-    echo "Discord Monitor   : ${timer_state:-inactive}"
+    echo "Nginx Status         : ${nginx_state:-unknown}"
+    echo "Player Gates         : ${active}/${total} active"
+    echo "Discord Monitor      : ${timer_state:-inactive}"
+    echo "Range Gate           : ${GATE_RANGE_MIN}-${GATE_RANGE_MAX}"
+    echo "Sisa Slot Acak Valid : ${slots}"
+    echo "Rule Jarak Port      : minimal jarak ${MIN_PORT_GAP} antar gate"
     echo "=============================================="
-}
-
-owner_menu() {
-    while true; do
-        echo ""
-        echo "--- MODE OWNER SERVER ---"
-        echo "1. Lihat Mapping"
-        echo "2. Tambah Mapping"
-        echo "3. Hapus Mapping"
-        echo "4. Apply/Reload Nginx"
-        echo "0. Kembali"
-        read -r -p "Pilih: " c
-        case "$c" in
-            1) list_owner_targets ;;
-            2) add_owner_target ;;
-            3) delete_owner_target ;;
-            4) apply_nginx_config ;;
-            0) return ;;
-            *) print_error "Pilihan tidak valid." ;;
-        esac
-    done
-}
-
-player_menu() {
-    while true; do
-        echo ""
-        echo "--- MODE PLAYER LIMITED ---"
-        echo "1. Lihat Gate"
-        echo "2. Tambah Gate"
-        echo "3. Ubah Limit"
-        echo "4. Suspend/Active Gate"
-        echo "5. Hapus Gate"
-        echo "6. Apply/Reload Nginx"
-        echo "0. Kembali"
-        read -r -p "Pilih: " c
-        case "$c" in
-            1) list_player_gates ;;
-            2) add_player_gate ;;
-            3) edit_player_gate_limit ;;
-            4) toggle_player_gate_status ;;
-            5) delete_player_gate ;;
-            6) apply_nginx_config ;;
-            0) return ;;
-            *) print_error "Pilihan tidak valid." ;;
-        esac
-    done
 }
 
 discord_menu() {
@@ -729,6 +816,7 @@ discord_menu() {
         echo "3. Enable Monitor 5 Menit"
         echo "4. Disable Monitor"
         echo "5. Status Monitor"
+        echo "6. Kirim Report Sekarang"
         echo "0. Kembali"
         read -r -p "Pilih: " c
         case "$c" in
@@ -737,6 +825,7 @@ discord_menu() {
             3) enable_discord_monitor ;;
             4) disable_discord_monitor ;;
             5) show_discord_monitor_status ;;
+            6) send_monitor_report_now ;;
             0) return ;;
             *) print_error "Pilihan tidak valid." ;;
         esac
@@ -748,10 +837,13 @@ main_menu() {
         show_dashboard
         echo ""
         echo "1. Setup Awal Nginx + Firewall"
-        echo "2. Mode Owner Server"
-        echo "3. Mode Player Limited"
-        echo "4. Discord Monitor"
-        echo "5. Apply/Reload Nginx"
+        echo "2. Lihat Gate Player"
+        echo "3. Tambah Gate Player (AUTO RANDOM)"
+        echo "4. Ubah Limit Gate"
+        echo "5. Suspend/Active Gate"
+        echo "6. Hapus Gate"
+        echo "7. Discord Monitor"
+        echo "8. Apply/Reload Nginx"
         echo "0. Keluar"
         read -r -p "Pilih menu: " mc
 
@@ -762,10 +854,13 @@ main_menu() {
                 cleanup_old_defaults
                 apply_nginx_config
                 ;;
-            2) owner_menu ;;
-            3) player_menu ;;
-            4) discord_menu ;;
-            5) apply_nginx_config ;;
+            2) list_player_gates ;;
+            3) add_player_gate_auto ;;
+            4) edit_player_gate_limit ;;
+            5) toggle_player_gate_status ;;
+            6) delete_player_gate ;;
+            7) discord_menu ;;
+            8) apply_nginx_config ;;
             0) exit 0 ;;
             *) print_error "Pilihan tidak valid." ;;
         esac
@@ -774,5 +869,4 @@ main_menu() {
 
 require_root
 ensure_base_files
-migrate_legacy_owner_targets
 main_menu
