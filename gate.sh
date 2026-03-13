@@ -92,6 +92,13 @@ get_used_gate_ports() {
     awk -F':' 'NF{print $1}' "$PLAYER_TARGETS_FILE" 2>/dev/null | grep -E '^[0-9]+$' | sort -n | uniq
 }
 
+refresh_used_ports_cache() {
+    USED_PORTS=()
+    if [ -s "$PLAYER_TARGETS_FILE" ]; then
+        mapfile -t USED_PORTS < <(get_used_gate_ports)
+    fi
+}
+
 port_exists_in_player() {
     local p="$1"
     grep -E "^${p}:" "$PLAYER_TARGETS_FILE" >/dev/null 2>&1
@@ -100,18 +107,19 @@ port_exists_in_player() {
 is_too_close_to_existing() {
     local p="$1"
     local ep
-    while IFS= read -r ep; do
+    for ep in "${USED_PORTS[@]}"; do
         [ -n "$ep" ] || continue
         local diff=$((p - ep))
         [ "$diff" -lt 0 ] && diff=$((diff * -1))
         if [ "$diff" -lt "$MIN_PORT_GAP" ]; then
             return 0
         fi
-    done < <(get_used_gate_ports)
+    done
     return 1
 }
 
 count_available_random_slots() {
+    refresh_used_ports_cache
     local c=0
     local p
     for p in $(seq "$GATE_RANGE_MIN" "$GATE_RANGE_MAX"); do
@@ -123,6 +131,7 @@ count_available_random_slots() {
 }
 
 pick_random_gate_port() {
+    refresh_used_ports_cache
     local p
 
     if command -v shuf >/dev/null 2>&1; then
