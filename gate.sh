@@ -120,14 +120,48 @@ is_too_close_to_existing() {
 
 count_available_random_slots() {
     refresh_used_ports_cache
-    local c=0
-    local p
-    for p in $(seq "$GATE_RANGE_MIN" "$GATE_RANGE_MAX"); do
-        if ! is_too_close_to_existing "$p"; then
-            c=$((c + 1))
+    local total_range covered start end s e merged_s merged_e used
+    total_range=$((GATE_RANGE_MAX - GATE_RANGE_MIN + 1))
+
+    if [ "${#USED_PORTS[@]}" -eq 0 ]; then
+        echo "$total_range"
+        return
+    fi
+
+    covered=0
+    merged_s=-1
+    merged_e=-1
+
+    for ep in "${USED_PORTS[@]}"; do
+        start=$((ep - (MIN_PORT_GAP - 1)))
+        end=$((ep + (MIN_PORT_GAP - 1)))
+
+        [ "$start" -lt "$GATE_RANGE_MIN" ] && start="$GATE_RANGE_MIN"
+        [ "$end" -gt "$GATE_RANGE_MAX" ] && end="$GATE_RANGE_MAX"
+        [ "$start" -le "$end" ] || continue
+
+        if [ "$merged_s" -lt 0 ]; then
+            merged_s="$start"
+            merged_e="$end"
+            continue
+        fi
+
+        if [ "$start" -le $((merged_e + 1)) ]; then
+            [ "$end" -gt "$merged_e" ] && merged_e="$end"
+        else
+            covered=$((covered + (merged_e - merged_s + 1)))
+            merged_s="$start"
+            merged_e="$end"
         fi
     done
-    echo "$c"
+
+    if [ "$merged_s" -ge 0 ]; then
+        covered=$((covered + (merged_e - merged_s + 1)))
+    fi
+
+    used=$((total_range - covered))
+    [ "$used" -lt 0 ] && used=0
+    echo "$used"
 }
 
 pick_random_gate_port() {
