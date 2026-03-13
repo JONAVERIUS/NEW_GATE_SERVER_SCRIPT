@@ -724,10 +724,11 @@ Description=Run FiveM Gate Monitor every 5 minutes
 
 [Timer]
 OnBootSec=2min
-OnUnitActiveSec=5min
+OnUnitInactiveSec=5min
 AccuracySec=30s
 Unit=fivem-gate-monitor.service
 Persistent=true
+RemainAfterElapse=no
 
 [Install]
 WantedBy=timers.target
@@ -784,6 +785,10 @@ JSON
 enable_discord_monitor() {
     create_monitor_script
     create_monitor_systemd_units
+    systemctl stop fivem-gate-monitor.timer >/dev/null 2>&1 || true
+    systemctl disable fivem-gate-monitor.timer >/dev/null 2>&1 || true
+    rm -f /var/lib/systemd/timers/stamp-fivem-gate-monitor.timer >/dev/null 2>&1 || true
+    systemctl reset-failed fivem-gate-monitor.service >/dev/null 2>&1 || true
     systemctl enable --now fivem-gate-monitor.timer >/dev/null 2>&1
     print_success "Monitor Discord aktif (interval 5 menit)."
 }
