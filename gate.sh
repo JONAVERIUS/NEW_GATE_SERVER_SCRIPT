@@ -1,9 +1,11 @@
 #!/bin/bash
 
 # ==============================================================================
-# FIVEM PLAYER GATE MANAGER (PLAYER ONLY)
+# FIVEM GATE MANAGER
 # - Random gate port auto-select in range 30000-39999
 # - Port must be unused and not adjacent (+/-1) to existing ports
+# - Player gate uses connection limits
+# - Server gate has no connection limit
 # - Discord webhook monitor every 5 minutes (systemd timer)
 # ==============================================================================
 
@@ -12,6 +14,7 @@ GATE_RANGE_MAX=39999
 MIN_PORT_GAP=25
 
 PLAYER_TARGETS_FILE="/etc/nginx/gate_player_targets.list"
+SERVER_TARGETS_FILE="/etc/nginx/gate_server_targets.list"
 WEBHOOK_CONFIG_FILE="/etc/nginx/gate_webhook.conf"
 STREAM_CONF_FILE="/etc/nginx/stream.conf"
 NGINX_CONF_FILE="/etc/nginx/nginx.conf"
@@ -35,6 +38,7 @@ ensure_base_files() {
     [ -d "/etc/nginx/ssl" ] || mkdir -p /etc/nginx/ssl
     [ -d "$MONITOR_STATE_DIR" ] || mkdir -p "$MONITOR_STATE_DIR"
     [ -f "$PLAYER_TARGETS_FILE" ] || touch "$PLAYER_TARGETS_FILE"
+    [ -f "$SERVER_TARGETS_FILE" ] || touch "$SERVER_TARGETS_FILE"
     [ -f "$WEBHOOK_CONFIG_FILE" ] || echo "WEBHOOK_URL=" > "$WEBHOOK_CONFIG_FILE"
 }
 
@@ -89,7 +93,10 @@ cleanup_old_defaults() {
 }
 
 get_used_gate_ports() {
-    awk -F':' 'NF{print $1}' "$PLAYER_TARGETS_FILE" 2>/dev/null | grep -E '^[0-9]+$' | sort -n | uniq
+    {
+        awk -F':' 'NF{print $1}' "$PLAYER_TARGETS_FILE" 2>/dev/null
+        awk -F':' 'NF{print $1}' "$SERVER_TARGETS_FILE" 2>/dev/null
+    } | grep -E '^[0-9]+$' | sort -n | uniq
 }
 
 refresh_used_ports_cache() {
@@ -102,6 +109,16 @@ refresh_used_ports_cache() {
 port_exists_in_player() {
     local p="$1"
     grep -E "^${p}:" "$PLAYER_TARGETS_FILE" >/dev/null 2>&1
+}
+
+port_exists_in_server() {
+    local p="$1"
+    grep -E "^${p}:" "$SERVER_TARGETS_FILE" >/dev/null 2>&1
+}
+
+port_exists_in_any_gate() {
+    local p="$1"
+    port_exists_in_player "$p" || port_exists_in_server "$p"
 }
 
 is_too_close_to_existing() {
@@ -190,13 +207,20 @@ pick_random_gate_port() {
     return 1
 }
 
-open_gate_ports_in_firewall() {
-    local p
+open_ports_from_file_in_firewall() {
+    local file="$1" p
+    [ -f "$file" ] || return
+
     while IFS=':' read -r p _; do
         [ -n "$p" ] || continue
         ufw allow "$p/tcp" >/dev/null 2>&1
         ufw allow "$p/udp" >/dev/null 2>&1
-    done < "$PLAYER_TARGETS_FILE"
+    done < "$file"
+}
+
+open_gate_ports_in_firewall() {
+    open_ports_from_file_in_firewall "$PLAYER_TARGETS_FILE"
+    open_ports_from_file_in_firewall "$SERVER_TARGETS_FILE"
 }
 
 write_main_nginx_conf() {
@@ -233,13 +257,13 @@ EOF
 generate_stream_conf() {
     echo "stream {" > "$STREAM_CONF_FILE"
 
-    # format: gate_port:target_ip:target_port:conn_limit:overflow:status:label
+    # player format: gate_port:target_ip:target_port:conn_limit:overflow:status:label
     local gp tip tport limit extra status label effective
     while IFS=':' read -r gp tip tport limit extra status label; do
         [ -n "$gp" ] || continue
         [ "$status" = "active" ] || continue
 
-        is_valid_range_port "$gp" || continue
+        is_valid_port "$gp" || continue
         is_valid_ipv4 "$tip" || continue
         is_valid_port "$tport" || continue
         [[ "$limit" =~ ^[0-9]+$ ]] || continue
@@ -265,6 +289,30 @@ generate_stream_conf() {
         echo "        limit_conn gate_conn_${gp} ${effective};" >> "$STREAM_CONF_FILE"
         echo "    }" >> "$STREAM_CONF_FILE"
     done < "$PLAYER_TARGETS_FILE"
+
+    # server format: gate_port:target_ip:target_port:status:label
+    while IFS=':' read -r gp tip tport status label; do
+        [ -n "$gp" ] || continue
+        [ "$status" = "active" ] || continue
+
+        is_valid_port "$gp" || continue
+        is_valid_ipv4 "$tip" || continue
+        is_valid_port "$tport" || continue
+
+        echo "    upstream server_backend_${gp} {" >> "$STREAM_CONF_FILE"
+        echo "        server ${tip}:${tport};" >> "$STREAM_CONF_FILE"
+        echo "    }" >> "$STREAM_CONF_FILE"
+
+        echo "    server {" >> "$STREAM_CONF_FILE"
+        echo "        listen ${gp};" >> "$STREAM_CONF_FILE"
+        echo "        proxy_pass server_backend_${gp};" >> "$STREAM_CONF_FILE"
+        echo "    }" >> "$STREAM_CONF_FILE"
+
+        echo "    server {" >> "$STREAM_CONF_FILE"
+        echo "        listen ${gp} udp reuseport;" >> "$STREAM_CONF_FILE"
+        echo "        proxy_pass server_backend_${gp};" >> "$STREAM_CONF_FILE"
+        echo "    }" >> "$STREAM_CONF_FILE"
+    done < "$SERVER_TARGETS_FILE"
 
     echo "}" >> "$STREAM_CONF_FILE"
 }
@@ -355,6 +403,83 @@ add_player_gate_auto() {
         print_success "Gate dibuat: ${gp} -> ${tip}:${tport} (limit ${limit}+${extra})"
     else
         print_error "Gate tersimpan, tapi apply config gagal."
+    fi
+}
+
+list_server_gates() {
+    echo ""
+    echo "--- SERVER GATES (MANUAL PORT / AUTO RANDOM RANGE ${GATE_RANGE_MIN}-${GATE_RANGE_MAX}) ---"
+    if [ ! -s "$SERVER_TARGETS_FILE" ]; then
+        echo "(Kosong)"
+        return
+    fi
+
+    printf "%-4s | %-10s | %-16s | %-8s | %-10s\n" "No" "Gate" "Backend" "Status" "Label"
+    echo "----------------------------------------------------------------"
+
+    local i=0
+    while IFS=':' read -r gp tip tport status label; do
+        [ -n "$gp" ] || continue
+        i=$((i + 1))
+        printf "%-4s | %-10s | %-16s | %-8s | %-10s\n" "$i" "$gp" "${tip}:${tport}" "$status" "${label:-server_$gp}"
+    done < "$SERVER_TARGETS_FILE"
+}
+
+add_server_gate_auto() {
+    echo ""
+    print_info "Tambah gate server (PORT MANUAL / RANDOM, TANPA LIMIT)"
+    read -r -p "Gate Port (kosong=auto random range ${GATE_RANGE_MIN}-${GATE_RANGE_MAX}, isi bebas 1-65535): " gp
+    read -r -p "Target Backend IP: " tip
+    read -r -p "Target Backend Port (default 30120): " tport
+    read -r -p "Label server (default auto): " label
+
+    tport=${tport:-30120}
+
+    if ! is_valid_ipv4 "$tip"; then
+        print_error "IP backend tidak valid (IPv4)."
+        return
+    fi
+    if ! is_valid_port "$tport"; then
+        print_error "Port backend tidak valid."
+        return
+    fi
+
+    local free_count
+    if [ -n "$gp" ]; then
+        if ! is_valid_port "$gp"; then
+            print_error "Gate port harus valid di range 1-65535."
+            return
+        fi
+        if port_exists_in_any_gate "$gp"; then
+            print_error "Gate port ${gp} sudah dipakai."
+            return
+        fi
+        refresh_used_ports_cache
+        if is_too_close_to_existing "$gp"; then
+            print_error "Gate port ${gp} terlalu dekat dengan gate lain. Minimal jarak ${MIN_PORT_GAP}."
+            return
+        fi
+    else
+        free_count=$(count_available_random_slots)
+        if [ "$free_count" -le 0 ]; then
+            print_error "Tidak ada port tersedia di range ${GATE_RANGE_MIN}-${GATE_RANGE_MAX} dengan jarak minimum ${MIN_PORT_GAP}."
+            return
+        fi
+
+        gp=$(pick_random_gate_port)
+        if [ -z "$gp" ]; then
+            print_error "Gagal memilih port random."
+            return
+        fi
+    fi
+
+    label=${label:-server_$gp}
+    echo "${gp}:${tip}:${tport}:active:${label}" >> "$SERVER_TARGETS_FILE"
+
+    if apply_nginx_config; then
+        print_success "Gate server dibuat: ${gp} -> ${tip}:${tport} (tanpa limit)"
+    else
+        print_error "Gate server tersimpan, tapi apply config gagal."
     fi
 }
 
@@ -451,6 +576,63 @@ delete_player_gate() {
         print_success "Gate dihapus: $selected"
     else
         print_error "Hapus tersimpan, tapi apply config gagal."
+    fi
+}
+
+toggle_server_gate_status() {
+    list_server_gates
+    [ -s "$SERVER_TARGETS_FILE" ] || return
+
+    read -r -p "Nomor gate server yang ingin suspend/active: " choice
+    [[ "$choice" =~ ^[0-9]+$ ]] || return
+    [ "$choice" -ge 1 ] || return
+
+    local row status new_status gp
+    row=$(awk -F':' -v n="$choice" 'NF{c++; if(c==n){print $0; exit}}' "$SERVER_TARGETS_FILE")
+    [ -n "$row" ] || return
+
+    gp=$(echo "$row" | cut -d':' -f1)
+    status=$(echo "$row" | cut -d':' -f4)
+    if [ "$status" = "active" ]; then
+        new_status="suspend"
+    else
+        new_status="active"
+    fi
+
+    awk -F':' -v n="$choice" -v ns="$new_status" 'BEGIN{OFS=":"}
+        NF{
+            c++
+            if(c==n){$4=ns}
+            print
+        }' "$SERVER_TARGETS_FILE" > "${SERVER_TARGETS_FILE}.tmp"
+    mv "${SERVER_TARGETS_FILE}.tmp" "$SERVER_TARGETS_FILE"
+
+    if apply_nginx_config; then
+        print_success "Status gate server ${gp} menjadi ${new_status}."
+    else
+        print_error "Status gate server tersimpan, tapi apply config gagal."
+    fi
+}
+
+delete_server_gate() {
+    list_server_gates
+    [ -s "$SERVER_TARGETS_FILE" ] || return
+
+    read -r -p "Nomor gate server yang ingin dihapus (0=batal): " choice
+    [[ "$choice" =~ ^[0-9]+$ ]] || return
+    [ "$choice" -ge 1 ] || return
+
+    local selected
+    selected=$(awk -F':' -v n="$choice" 'NF{c++; if(c==n){print $0; exit}}' "$SERVER_TARGETS_FILE")
+    [ -n "$selected" ] || return
+
+    awk -F':' -v n="$choice" 'NF{c++; if(c!=n) print $0}' "$SERVER_TARGETS_FILE" > "${SERVER_TARGETS_FILE}.tmp"
+    mv "${SERVER_TARGETS_FILE}.tmp" "$SERVER_TARGETS_FILE"
+
+    if apply_nginx_config; then
+        print_success "Gate server dihapus: $selected"
+    else
+        print_error "Hapus gate server tersimpan, tapi apply config gagal."
     fi
 }
 
@@ -834,20 +1016,27 @@ count_player_active_ports() {
     awk -F':' '$6=="active"{print $1}' "$PLAYER_TARGETS_FILE" 2>/dev/null | grep -E '^[0-9]+$' | sort -n | uniq | wc -l
 }
 
+count_server_active_ports() {
+    awk -F':' '$4=="active"{print $1}' "$SERVER_TARGETS_FILE" 2>/dev/null | grep -E '^[0-9]+$' | sort -n | uniq | wc -l
+}
+
 show_dashboard() {
-    local nginx_state active total timer_state slots
+    local nginx_state player_active player_total server_active server_total timer_state slots
     nginx_state=$(systemctl is-active nginx 2>/dev/null || true)
-    active=$(count_player_active_ports)
-    total=$(grep -c '^[0-9]' "$PLAYER_TARGETS_FILE" 2>/dev/null)
+    player_active=$(count_player_active_ports)
+    player_total=$(grep -c '^[0-9]' "$PLAYER_TARGETS_FILE" 2>/dev/null)
+    server_active=$(count_server_active_ports)
+    server_total=$(grep -c '^[0-9]' "$SERVER_TARGETS_FILE" 2>/dev/null)
     timer_state=$(systemctl is-active fivem-gate-monitor.timer 2>/dev/null || true)
     slots=$(count_available_random_slots)
 
     echo ""
     echo "=============================================="
-    echo "        FIVEM PLAYER GATE DASHBOARD"
+    echo "          FIVEM GATE DASHBOARD"
     echo "=============================================="
     echo "Nginx Status         : ${nginx_state:-unknown}"
-    echo "Player Gates         : ${active}/${total} active"
+    echo "Player Gates         : ${player_active}/${player_total} active"
+    echo "Server Gates         : ${server_active}/${server_total} active"
     echo "Discord Monitor      : ${timer_state:-inactive}"
     echo "Range Gate           : ${GATE_RANGE_MIN}-${GATE_RANGE_MAX}"
     echo "Sisa Slot Acak Valid : ${slots}"
@@ -887,11 +1076,15 @@ main_menu() {
         echo "1. Setup Awal Nginx + Firewall"
         echo "2. Lihat Gate Player"
         echo "3. Tambah Gate Player (AUTO RANDOM)"
-        echo "4. Ubah Limit Gate"
-        echo "5. Suspend/Active Gate"
-        echo "6. Hapus Gate"
-        echo "7. Discord Monitor"
-        echo "8. Apply/Reload Nginx"
+        echo "4. Ubah Limit Gate Player"
+        echo "5. Suspend/Active Gate Player"
+        echo "6. Hapus Gate Player"
+        echo "7. Lihat Gate Server"
+        echo "8. Tambah Gate Server (MANUAL / RANDOM, TANPA LIMIT)"
+        echo "9. Suspend/Active Gate Server"
+        echo "10. Hapus Gate Server"
+        echo "11. Discord Monitor"
+        echo "12. Apply/Reload Nginx"
         echo "0. Keluar"
         read -r -p "Pilih menu: " mc
 
@@ -907,8 +1100,12 @@ main_menu() {
             4) edit_player_gate_limit ;;
             5) toggle_player_gate_status ;;
             6) delete_player_gate ;;
-            7) discord_menu ;;
-            8) apply_nginx_config ;;
+            7) list_server_gates ;;
+            8) add_server_gate_auto ;;
+            9) toggle_server_gate_status ;;
+            10) delete_server_gate ;;
+            11) discord_menu ;;
+            12) apply_nginx_config ;;
             0) exit 0 ;;
             *) print_error "Pilihan tidak valid." ;;
         esac
